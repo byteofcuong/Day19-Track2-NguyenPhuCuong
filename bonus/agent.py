@@ -147,7 +147,7 @@ class HybridMemoryAgent:
             return None
 
     def profile(self, user_id: str) -> dict[str, Any]:
-        """Point lookup — NB4 measured P99 = 0.46 ms against the SQLite online store."""
+        """Point lookup — NB4 measured P99 = 0.43 ms against the SQLite online store."""
         if self._store is None:
             return {}
         try:

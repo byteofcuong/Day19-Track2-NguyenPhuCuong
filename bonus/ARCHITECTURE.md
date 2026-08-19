@@ -26,7 +26,7 @@ flowchart TB
     subgraph R["Đường đọc - recall()"]
         Q["Câu hỏi"] --> L1["lexical<br/>BM25 + sàn 0.25·max"]
         Q --> L2["semantic<br/>filtered-ANN, must user_id"]
-        P["profile lookup<br/>P99 = 0,46 ms"] --> L3["affinity<br/>memory cùng topic_affinity"]
+        P["profile lookup<br/>P99 = 0,43 ms"] --> L3["affinity<br/>memory cùng topic_affinity"]
         L1 --> RRF{"Weighted RRF<br/>k=60 · w_aff=0,35"}
         L2 --> RRF
         L3 --> RRF
@@ -121,7 +121,7 @@ view, để chỉ còn một kho duy nhất
 Nghe hấp dẫn: một registry, một đường materialize, một mô hình quyền. Bỏ vì
 **nhịp ghi lệch nhau hai bậc độ lớn**. Ký ức sinh ra mỗi lượt trò chuyện và
 phải tìm được ngay lập tức; hồ sơ đổi mỗi ngày. Feature store tối ưu cho *point
-lookup theo khoá* - NB4 đo được P99 = 0,46 ms - chứ không phải cho tìm kiếm
+lookup theo khoá* - NB4 đo được P99 = 0,43 ms - chứ không phải cho tìm kiếm
 xấp xỉ theo độ tương tự; nó không có HNSW, không có filtered-ANN, không có
 over-fetch. Bắt nó phục vụ truy hồi ngữ nghĩa là dùng sai công cụ, rồi sẽ phải
 tự viết lại ANN bên trên nó
@@ -154,22 +154,24 @@ context của `u_001`
   yêu cầu "xoá dữ liệu của tôi" trở thành một `delete` theo filter, không phải
   một cuộc rà soát toàn index
 
-## POC này **chưa** làm được gì
+---
 
-1. **Không bền vững.** Qdrant chạy in-memory, BM25 dựng lại từ RAM - tắt tiến
-   trình là mất ký ức. Production cần Qdrant server + WAL
-2. **Cách ly chỉ ở tầng ứng dụng.** Một lỗi bỏ sót filter là rò dữ liệu chéo
-   người dùng. Đúng ra phải thêm hàng rào ở tầng dưới (collection riêng cho
-   khách hàng lớn) và một test hồi quy chạy trong CI
-3. **Không khâu lại chunk lúc đọc**, đúng cái giá đã nêu ở Quyết định 1
-4. **Không có quên/nén.** Ký ức chỉ tăng. Cần TTL cho ký ức nguội và một bước
-   gộp 5 ký ức gần nhau thành 1 bản tóm tắt tuần
-5. **`remember()` là đồng bộ** - mỗi lần ghi trả tiền cho một lượt embed
-   (~47 ms trên máy này, đo ở NB3 §4b). Production phải đẩy qua hàng đợi
-6. **Chưa có cache ngữ nghĩa.** NB7 cho thấy ngưỡng 0,75 để lọt **36%** câu
-   trả lời sai; cache cho trí nhớ cá nhân phải namespace theo `user_id` và
-   ngưỡng ≥ 0,85, nếu không thì bug caching biến thành sự cố bảo mật
-7. **Chưa nối PIT join vào vòng huấn luyện.** Sơ đồ có nhánh đó, code thì
-   chưa - nhưng NB8 đã đo cái giá của việc làm sai: latest-value join thổi
-   AUC lên **+0,120** so với PIT join, và **98,2%** số dòng huấn luyện chứa
-   giá trị ghi sau nhãn
+## Vibe-coding log
+
+Làm cá nhân, dùng AI assistant trong terminal
+
+**Prompt hiệu quả nhất** - "đừng tối ưu vội, phân rã ngân sách latency theo
+tầng trước đã"
+
+Khi NB3 báo P99 = 80,8 ms, phản xạ của cả tôi lẫn AI là hạ
+`depth` của RRF. Bảng phân rã cho thấy BM25 + ANN chưa tới 5% ngân sách - hạ
+depth sẽ giảm chất lượng fusion mà không giảm latency. Đo trước khi sửa đã
+chặn đúng một thay đổi sai
+
+**Prompt fail** - "vậy kết luận là gì?" 
+
+AI đáp "CPU máy này chậm, chấp nhận
+thôi", và tôi tin vì nó khớp mọi dữ liệu đang có. Vẫn sai. Prompt cứu vãn hỏi
+tính hợp lý chứ không hỏi kết luận: "46 ms cho bge-small ở 18 token là vô lý -
+giả định nào đang sai?" Bisect ra hồi quy ~10× ở `onnxruntime` 1.29.0
+
