@@ -10,6 +10,9 @@ readme = "README.md"
 dependencies = [
     "qdrant-client[fastembed]>=1.12,<2.0",
     "fastembed>=0.4,<1.0",
+    # onnxruntime 1.29.0 is a ~10x CPU inference regression for bge-small
+    # (45.9 ms vs 4.0 ms per query forward pass). See requirements.txt.
+    "onnxruntime>=1.22,<1.29",
     "rank-bm25>=0.2.2,<1.0",
     "feast>=0.41,<1.0",
     "fastapi>=0.115,<1.0",
@@ -33,7 +36,7 @@ docker = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["app", "scripts"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 
 [tool.ruff]

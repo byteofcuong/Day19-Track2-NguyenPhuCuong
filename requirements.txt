@@ -6,6 +6,18 @@
 qdrant-client[fastembed]>=1.12,<2.0    # fastembed bundled; in-memory mode
 fastembed>=0.4,<1.0                    # ONNX BGE-small CPU embeddings
 
+# ONNX runtime — fastembed pulls this in transitively and does not cap it.
+# onnxruntime 1.29.0 is a ~10x CPU inference regression for this model: a
+# single 18-token forward pass through bge-small-en-v1.5 (int8) measures
+# 45.9 ms on 1.29.0 versus 4.0 ms on 1.28.0, on the same machine, same model
+# file, same session options (thread count and graph_optimization_level make
+# no difference). That one number is 95% of hybrid search latency, so it is
+# the difference between P99 = 80.8 ms and P99 = 11.0 ms in NB3.
+# Bisected across 1.22.1 / 1.25.1 / 1.26.0 / 1.27.0 / 1.28.0 — all fast; only
+# 1.29.0 is slow. fastembed 0.8 requires >1.21.0 on Python 3.13, so the cap
+# below stays inside what it supports.
+onnxruntime>=1.22,<1.29
+
 # Lexical search
 rank-bm25>=0.2.2,<1.0
 

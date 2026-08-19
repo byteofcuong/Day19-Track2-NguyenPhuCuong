@@ -93,7 +93,7 @@ def evaluate(agent, label):
         calls.append(r.n_calls)
         ms.append(r.latency_ms)
     n = len(queries)
-    print(f"{label:<14}{sum(rec)/n:8.3f}{sum(bal)/n:9.2f}{sum(calls)/n:8.1f}{sum(ms)/n:9.1f}")
+    print(f"{label:<20}{sum(rec)/n:8.3f}{sum(bal)/n:9.2f}{sum(calls)/n:8.1f}{sum(ms)/n:9.1f}")
     return sum(rec) / n
 
 

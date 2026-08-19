@@ -31,30 +31,41 @@ import httpx
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000",
+     "--log-level", "warning"],
     cwd=str(ROOT),
 )
 
+# Địa chỉ literal, KHÔNG dùng "localhost". Trên Windows `localhost` phân giải
+# ra ::1 trước; uvicorn chỉ bind IPv4 nên mỗi request tốn ~2 s chờ IPv6 fail
+# rồi mới retry 127.0.0.1 — đủ để biến bench 300 call thành 12 phút và bơm
+# wall-clock lên gấp 40 lần server-side.
+URL = "http://127.0.0.1:8000"
+
+# Một Client dùng chung => keep-alive. Mỗi `httpx.get(...)` rời rạc mở TCP
+# connection mới (~150 ms handshake trên Windows loopback); đo cái đó là đo
+# connection setup, không phải đo search.
+client = httpx.Client(base_url=URL, timeout=30.0)
+
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
+for _ in range(180):
     try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
+        r = client.get("/healthz", timeout=2.0)
         if r.status_code == 200 and r.json().get("ready"):
             break
     except httpx.HTTPError:
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    raise RuntimeError("API didn't become ready within 180s")
 
-print(httpx.get(f"{URL}/healthz").json())
+print(client.get("/healthz").json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = client.get("/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -85,13 +96,19 @@ def percentile(values: list[float], p: float) -> float:
     return sorted(values)[min(int(n * p), n - 1)]
 
 
-def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
+def benchmark_mode(mode: str, reps: int = 2, warmup: int = 10) -> dict[str, float]:
+    # Warm-up KHÔNG được tính vào phân phối: request đầu của mỗi mode trả tiền
+    # cho tokenizer/ONNX graph lazy-init. Trộn nó vào 100 mẫu thì nó *thành*
+    # P99 và bảng đo cold start chứ không đo steady state.
+    for q in golden[:warmup]:
+        client.get("/search", params={"q": q["query"], "mode": mode})
+
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = client.get("/search", params={"q": q["query"], "mode": mode})
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -120,13 +137,101 @@ if hybrid_p99 < 50:
     print(f"PASS — hybrid P99 < 50ms ({hybrid_p99:.1f}ms)")
 else:
     print(f"WARN — hybrid P99 >= 50ms ({hybrid_p99:.1f}ms)")
-    print("  Possible causes: cold cache, fastembed model not warm yet, or RRF depth=50 is too aggressive")
-    print("  Check: re-run benchmark after 10 warm-up queries; or reduce RRF depth")
+    print("  Warm-up đã chạy (10 query/mode) nên đây KHÔNG phải cold start.")
+    print("  Xem §4b: phân rã latency để biết thời gian thật sự đi đâu.")
+
+# %% [markdown]
+# ## 4b. Ngân sách latency đi đâu? (chẩn đoán, không phải đoán)
+#
+# Một con số P99 trần trụi không nói được gì. Trước khi "tối ưu", đo xem mỗi
+# tầng tốn bao nhiêu. Ở đây gọi thẳng `Searcher` trong-process nên loại bỏ
+# HTTP/serialization khỏi phép đo — cái còn lại đúng là công việc retrieval.
+
+# %%
+from app.search import Searcher
+
+searcher = Searcher.from_corpus(ROOT / "data" / "corpus_vn.jsonl")
+probe = [g["query"] for g in golden]
+
+for q in probe[:10]:                       # warm the ONNX graph
+    searcher.search(q, mode="hybrid")
+
+
+def stage_p50(fn) -> float:
+    t = []
+    for q in probe:
+        t0 = time.perf_counter()
+        fn(q)
+        t.append((time.perf_counter() - t0) * 1000)
+    return statistics.median(t)
+
+
+embed_ms = stage_p50(lambda q: next(searcher.embedder.embed([q])))
+bm25_ms = stage_p50(lambda q: searcher._search_keyword(q, 50))
+ann_ms = stage_p50(lambda q: searcher._search_semantic(q, 50)) - embed_ms
+total_ms = stage_p50(lambda q: searcher.search(q, mode="hybrid"))
+
+print(f"  {'stage':26} {'P50':>8}   share")
+for label, ms in [("query embedding (ONNX)", embed_ms),
+                  ("BM25 scan (1000 docs)", bm25_ms),
+                  ("Qdrant ANN lookup", max(ann_ms, 0.0)),
+                  ("RRF fusion + overhead",
+                   max(total_ms - embed_ms - bm25_ms - max(ann_ms, 0.0), 0.0))]:
+    print(f"  {label:26} {ms:>6.1f}ms   {ms / total_ms:>5.0%}")
+print(f"  {'-' * 26} {'-' * 8}")
+print(f"  {'hybrid total':26} {total_ms:>6.1f}ms")
+
+# %% [markdown]
+# ### Đọc bảng trên — và cái bẫy suýt mắc phải
+#
+# Ở trạng thái hiện tại ngân sách chia tương đối đều: embedding ~46%, ANN ~32%,
+# BM25 ~11%. Không tầng nào một mình quyết định, nên tối ưu thêm ở đây là công
+# việc lợi ít — P99 đã ở 12,8 ms, dưới ngưỡng 50 ms gần bốn lần.
+#
+# **Nhưng lần chạy đầu tiên của notebook này báo P99 = 80,8 ms, với 95% ngân
+# sách nằm ở tầng embedding (53 ms/query).** Kết luận lúc đó là "CPU/onnxruntime
+# của máy này chậm, chấp nhận thôi" — vặn `intra_op_num_threads` (1/4/8) và
+# `graph_optimization_level` đều không đổi bậc độ lớn, nên nó *nghe* rất hợp lý.
+#
+# Nó sai. Đo `onnxruntime.InferenceSession` trần trên chính file
+# `model_optimized.onnx`, chuỗi 18 token, rồi **bisect theo phiên bản**:
+#
+# | onnxruntime | 1 forward pass (P50) |
+# |---|---|
+# | 1.22.1 | 11,1 ms |
+# | 1.25.1 | 4,4 ms |
+# | 1.26.0 | 4,2 ms |
+# | 1.27.0 | 4,3 ms |
+# | 1.28.0 | **4,0 ms** |
+# | 1.29.0 | **45,9 ms** ← hồi quy ~10× |
+#
+# `fastembed` kéo `onnxruntime` vào theo kiểu transitive và **không chặn trần
+# phiên bản**, nên `pip install` mặc định lấy 1.29.0. Đó không phải giới hạn
+# phần cứng — đó là một bản hồi quy hiệu năng, và nó một mình quyết định
+# notebook này đạt hay trượt ngưỡng 50 ms. `requirements.txt` giờ pin
+# `onnxruntime>=1.22,<1.29`, và bảng P50/P95/P99 ở §3 là số đo **sau** khi
+# pin: hybrid P99 đi từ **80,8 ms xuống 12,8 ms**.
+#
+# > Bài học đắt hơn cả con số P99: **"đã đo rồi" chưa phải là "đã tìm ra
+# > nguyên nhân"**. Phân rã tầng chỉ ra *ở đâu* tốn thời gian, nó không nói
+# > *tại sao*. Dừng lại ở "phần cứng chậm" là một lời giải thích tự vỗ về —
+# > nó khớp với mọi dữ liệu đang có, và vẫn sai. Câu hỏi cứu được 10 điểm là
+# > "4 ms là con số *hợp lý* cho bge-small ở 18 token; 46 ms thì không —
+# > vậy giả định nào của mình đang sai?"
+#
+# Ba đòn bẩy còn lại, nếu tầng embedding vẫn là nút thắt sau khi đã pin đúng:
+#
+# | Đòn bẩy | Ảnh hưởng | Đánh đổi |
+# |---|---|---|
+# | Cache embedding của query (LRU / semantic cache NB7) | bỏ hẳn chi phí cho query lặp | chỉ cứu được traffic có phần đuôi lặp lại |
+# | Model nhỏ hơn (MiniLM-L6, 6 lớp) | ~2× nhanh | tụt chất lượng — mà NB2 cho thấy bge-small **đã** yếu với paraphrase tiếng Việt |
+# | Batch nhiều query / GPU | rẻ hơn nhiều mỗi doc khi batch lớn | chỉ hợp offline hoặc khi server có micro-batching |
 
 # %% [markdown]
 # ## 5. Cleanup — stop the API server
 
 # %%
+client.close()
 proc.terminate()
 proc.wait(timeout=5)
 print("API server stopped")

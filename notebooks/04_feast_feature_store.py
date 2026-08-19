@@ -83,6 +83,14 @@ for p in sorted(FEAST_DATA.glob("*.parquet")):
 # Chạy `feast apply` để Feast đọc file definition và ghi vào `registry.db`.
 
 # %%
+# Registry + online store là artifact sinh ra, không phải source. Nếu để lại
+# từ lần chạy trước thì `feast apply` chỉ in "Updated feature view ..." và
+# `materialize-incremental` thấy watermark đã ở hiện tại nên **không chép dòng
+# nào** — log trông như thành công mà thật ra không làm gì. Xoá trước để lần
+# chạy này thật sự tái lập được từ đầu.
+for artifact in ("registry.db", "online_store.db"):
+    (FEAST_DIR / artifact).unlink(missing_ok=True)
+
 res = subprocess.run(
     ["feast", "apply"],
     cwd=str(FEAST_DIR),
@@ -94,6 +102,21 @@ if res.stderr:
     print("STDERR:")
     print(res.stderr)
 assert res.returncode == 0, f"feast apply failed: {res.stderr}"
+
+# %% [markdown]
+# ### `feast feature-views list` — 3 view đã vào registry
+
+# %%
+res = subprocess.run(
+    ["feast", "feature-views", "list"],
+    cwd=str(FEAST_DIR),
+    capture_output=True, text=True, check=False,
+)
+print(res.stdout)
+assert res.returncode == 0, res.stderr
+for name in ("user_profile_features", "item_popularity_features", "query_velocity_features"):
+    assert name in res.stdout, f"{name} missing from registry"
+print("3/3 feature views registered")
 
 # %% [markdown]
 # ## 3. `feast materialize-incremental` — load offline → online
@@ -183,19 +206,59 @@ else:
 
 # %%
 import pandas as pd
+
+PIT_FEATURES = [
+    "user_profile_features:reading_speed_wpm",
+    "user_profile_features:topic_affinity",
+]
+
+# `make_user_profile` gán event_timestamp = NOW - (i % 48) giờ, nên:
+#   u_001 -> NOW-1h,  u_002 -> NOW-2h,  u_003 -> NOW-3h
+# Mỗi event row dưới đây đứng SAU thời điểm feature của user đó, nên cả 3 đều
+# có giá trị hợp lệ để join.
+print(
+    "feature timestamps:",
+    make_user_profile()
+    .filter(pl.col("user_id").is_in(["u_001", "u_002", "u_003"]))
+    .select("user_id", "event_timestamp")
+    .to_dicts(),
+)
+
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    "event_timestamp": [
+        NOW - timedelta(minutes=30),    # sau NOW-1h  -> hợp lệ
+        NOW - timedelta(minutes=90),    # sau NOW-2h  -> hợp lệ
+        NOW,                            # sau NOW-3h  -> hợp lệ
+    ],
 })
 
-historical = fs.get_historical_features(
-    entity_df=entity_df,
-    features=[
-        "user_profile_features:reading_speed_wpm",
-        "user_profile_features:topic_affinity",
-    ],
-).to_df()
+historical = fs.get_historical_features(entity_df=entity_df, features=PIT_FEATURES).to_df()
+print(f"\nPIT join -> {historical.shape[0]} rows x {historical.shape[1]} cols")
 print(historical)
+assert historical.shape[0] == 3, "expected 3 rows out of the PIT join"
+
+# %% [markdown]
+# ### PIT join **từ chối** giá trị tương lai — đây mới là điểm mấu chốt
+#
+# Ở trên mọi row đều tìm được giá trị vì event đứng sau feature. Bây giờ hỏi
+# đúng u_001 nhưng ở thời điểm **trước** khi profile của họ tồn tại (NOW-3h,
+# trong khi bản ghi duy nhất là NOW-1h). Một `latest join` ngây thơ sẽ vui vẻ
+# trả 187 wpm — và đó chính là data leakage: model được huấn luyện với thông
+# tin chưa hề tồn tại lúc dự đoán. Feast trả về **không có giá trị**.
+
+# %%
+leak_probe = pd.DataFrame({
+    "user_id": ["u_001"],
+    "event_timestamp": [NOW - timedelta(hours=3)],   # trước NOW-1h
+})
+leaked = fs.get_historical_features(entity_df=leak_probe, features=PIT_FEATURES).to_df()
+print(leaked)
+print(
+    "\nPIT correct — không rò giá trị tương lai"
+    if leaked.empty or leaked["reading_speed_wpm"].isna().all()
+    else "\nLEAK! giá trị tương lai đã lọt vào training row"
+)
 
 # %% [markdown]
 # ## Deliverable evidence
@@ -205,7 +268,8 @@ print(historical)
 # 3. Output cell 4: `materialize` log showing rows materialized to online store.
 # 4. Output cell 5: 1 online lookup result + latency.
 # 5. Output cell 6: 100-lookup P50/P95/P99 + PASS line.
-# 6. Output cell 7: PIT join DataFrame (3 rows × features).
+# 6. Output cell 7: PIT join DataFrame (3 rows × features) + probe chứng minh
+#    PIT không rò giá trị tương lai.
 #
 # ---
 #

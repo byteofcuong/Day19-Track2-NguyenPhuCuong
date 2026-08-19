@@ -2,12 +2,15 @@
 ## Two paths: lightweight (default, no Docker) and full Docker.
 
 VENV     := .venv
-PY       := $(VENV)/bin/python
-PIP      := $(VENV)/bin/pip
-JUPYTER  := $(VENV)/bin/jupyter
-JUPYTEXT := $(VENV)/bin/jupytext
-UVICORN  := $(VENV)/bin/uvicorn
-PYTEST   := $(VENV)/bin/pytest
+# venv console scripts live in Scripts/ on Windows and bin/ on macOS/Linux.
+# Detect rather than assume, so `make test` / `make notebooks` work on all three.
+VENV_BIN := $(if $(wildcard $(VENV)/Scripts/python.exe),$(VENV)/Scripts,$(VENV)/bin)
+PY       := $(VENV_BIN)/python
+PIP      := $(VENV_BIN)/pip
+JUPYTER  := $(VENV_BIN)/jupyter
+JUPYTEXT := $(VENV_BIN)/jupytext
+UVICORN  := $(VENV_BIN)/uvicorn
+PYTEST   := $(VENV_BIN)/pytest
 
 .DEFAULT_GOAL := help
 
@@ -49,10 +52,13 @@ notebooks: ## [both] Execute ALL notebooks headless (what the grader runs)
 	@$(JUPYTEXT) --to notebook --update notebooks/[0-9]*.py >/dev/null 2>&1 || true
 	@for nb in notebooks/[0-9]*.ipynb; do \
 		printf '%-42s' "$$nb"; \
-		PATH="$(PWD)/$(VENV)/bin:$$PATH" $(VENV)/bin/jupyter nbconvert --to notebook \
+		PATH="$(CURDIR)/$(VENV_BIN):$$PATH" $(JUPYTER) nbconvert --to notebook \
 			--execute --inplace "$$nb" --ExecutePreprocessor.timeout=900 \
 			>/dev/null 2>&1 && echo PASS || echo FAIL; \
 	done
+
+screenshots: ## [both] Render executed-notebook output into submission/screenshots/
+	@$(PY) scripts/make_screenshots.py
 
 clean-lite: ## [lite] Wipe venv + data + Feast registry
 	rm -rf $(VENV) data/corpus_vn.jsonl data/golden_set.jsonl data/qdrant_storage \
@@ -90,6 +96,6 @@ docker-down: ## [docker] Stop services (data persists)
 docker-clean: ## [docker] Stop AND wipe Qdrant + Redis + Postgres volumes
 	docker compose down -v
 
-.PHONY: help setup-lite verify-lite seed gen-advanced notebooks api lab benchmark test clean-lite \
+.PHONY: help setup-lite verify-lite seed gen-advanced notebooks screenshots api lab benchmark test clean-lite \
         setup-docker verify-docker docker-up docker-down docker-clean \
         runtime-check container-up container-down
